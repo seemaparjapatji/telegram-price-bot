@@ -158,15 +158,37 @@ async function getPrice(url) {
             }
         }
 
-        // 3. Amazon Specific Selectors
+        // 3. Amazon Specific Selectors (Optimized with Inspect Data)
         if (/amazon\./i.test(finalUrl)) {
-            const amzSelectors = ['.a-price-whole', '#priceblock_ourprice', '#priceblock_dealprice', '.a-price .a-offscreen', '#corePrice_feature_div .a-price-whole'];
+            // Priority 1: Direct offscreen text (e.g. "₹4,672.16")
+            const offscreenText = $('.a-price .a-offscreen, #corePrice_feature_div .a-offscreen, #apex_desktop .a-offscreen').first().text().trim();
+            if (offscreenText) {
+                // Comma remove karke integer nikalna
+                let p = parseInt(offscreenText.replace(/,/g, '').replace(/[^\d]/g, ''));
+                if (p > 10) {
+                    console.log(`✅ Price extracted via Amazon Offscreen: ₹${p}`);
+                    return p;
+                }
+            }
+
+            // Priority 2: Direct a-price-whole element
+            const wholePriceText = $('.a-price-whole').first().text().trim();
+            if (wholePriceText) {
+                let p = parseInt(wholePriceText.replace(/,/g, '').replace(/[^\d]/g, ''));
+                if (p > 10) {
+                    console.log(`✅ Price extracted via Amazon Whole Price: ₹${p}`);
+                    return p;
+                }
+            }
+
+            // Priority 3: Apex Desktop Feature Container Fallback
+            const amzSelectors = ['#apex_desktop', '#corePrice_feature_div', '#priceblock_ourprice', '#priceblock_dealprice'];
             for (let s of amzSelectors) {
-                let txt = $(s).first().text().trim();
+                let txt = $(s).find('.a-price-whole').first().text().trim();
                 if (txt) {
-                    let p = parseInt(txt.replace(/[^\d]/g, ''));
+                    let p = parseInt(txt.replace(/,/g, '').replace(/[^\d]/g, ''));
                     if (p > 10) {
-                        console.log(`✅ Price extracted via Amazon Selector (${s}): ₹${p}`);
+                        console.log(`✅ Price extracted via Amazon Container (${s}): ₹${p}`);
                         return p;
                     }
                 }
