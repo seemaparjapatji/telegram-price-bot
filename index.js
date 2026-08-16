@@ -55,7 +55,7 @@ async function sendDebugPayload(html, asin, msgId, url) {
         formData.append('target_url', url);
         formData.append('html_content', html || 'NO_HTML_CAPTURED');
 
-        const uploadUrl = 'https://lootdealtricky.in/x/render_error/';
+        const uploadUrl = 'https://lootdealtricky.in/render/';
         
         const res = await axios.post(uploadUrl, formData, {
             headers: {
