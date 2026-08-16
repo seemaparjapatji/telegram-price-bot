@@ -31,7 +31,7 @@ function getRandomUA() {
 
 /* ================= BOT START ================= */
 bot.launch({ dropPendingUpdates: true }).then(() => {
-    console.log("🚀 Bot is live with Debug Capture System!");
+    console.log("🚀 Bot is live with Mobile API & Debug Capture System!");
     cleanupOldTasks();
 }).catch(err => console.error("❌ Launch Error:", err.message));
 
@@ -49,12 +49,11 @@ async function sendDebugPayload(html, asin, msgId, url) {
     try {
         console.log(`📸 Generating & Uploading Debug Snapshot for ASIN: ${asin || msgId}...`);
         
-        // Form Data create karna screenshot/html upload ke liye
         const formData = new FormData();
         formData.append('asin', asin || 'unknown');
         formData.append('msgId', String(msgId));
         formData.append('target_url', url);
-        formData.append('html_content', html);
+        formData.append('html_content', html || 'NO_HTML_CAPTURED');
 
         const uploadUrl = 'https://lootdealtricky.in/x/render_error/';
         
@@ -130,56 +129,82 @@ async function getPrice(url, msgId) {
             if (asinMatch && asinMatch[1]) {
                 extractedAsin = asinMatch[1];
                 finalUrl = `https://www.amazon.in/dp/${extractedAsin}`;
-                console.log(`🎯 Amazon Clean Mobile URL: ${finalUrl}`);
+                console.log(`🎯 Amazon ASIN Identified: ${extractedAsin}`);
             }
         }
 
-        // 1. Amazon Internal AJAX Fetch
+        // ================= SOLUTION 1: AMAZON MOBILE APP API =================
         if (extractedAsin) {
             try {
-                const ajaxUrl = `https://www.amazon.in/gp/product/ajax/ref=auto_ev?asin=${extractedAsin}&deviceType=mobile`;
-                console.log(`📡 Hitting Amazon Internal AJAX API for ASIN: ${extractedAsin}`);
+                const appApiUrl = `https://www.amazon.in/api/p/detail/v2/get?asin=${extractedAsin}`;
+                console.log(`📱 Querying Amazon Mobile App API for ASIN: ${extractedAsin}`);
 
-                const { data: ajaxHtml } = await axios.get(ajaxUrl, {
+                const appRes = await axios.get(appApiUrl, {
                     headers: {
-                        'User-Agent': getRandomUA(),
-                        'Accept': 'text/html,*/*',
-                        'X-Requested-With': 'XMLHttpRequest',
-                        'Accept-Language': 'en-IN,en;q=0.9'
+                        'User-Agent': 'com.amazon.mShop.android.shopping/24.1.0 (Android 13; Build/TP1A.220624.014)',
+                        'Accept': 'application/json',
+                        'Accept-Language': 'en-IN,en;q=0.9',
+                        'x-amz-access-token': ''
                     },
                     timeout: 8000
                 });
 
-                fetchedHtml = ajaxHtml;
-                const $ajax = cheerio.load(ajaxHtml);
-                const priceText = $ajax('.a-price .a-offscreen, .priceBlockBuyingPriceString, .a-color-price').first().text().trim();
-                
-                if (priceText) {
-                    let p = parseInt(priceText.replace(/,/g, '').replace(/[^\d]/g, ''));
-                    if (p > 10) {
-                        console.log(`✅ Price via Amazon AJAX API: ₹${p}`);
-                        return p;
+                if (appRes.data) {
+                    const resStr = JSON.stringify(appRes.data);
+                    
+                    // Stock status check
+                    if (resStr.toLowerCase().includes("currently unavailable") || resStr.toLowerCase().includes("out of stock")) {
+                        console.log(`🔴 Status via Mobile API: Out of Stock (Marked 9999999)`);
+                        return 9999999;
+                    }
+
+                    // Price Extraction from JSON response
+                    let priceVal = appRes.data.price?.buyingPrice || appRes.data.price?.amount || appRes.data.buyingPrice;
+                    if (!priceVal) {
+                        const rawPriceMatch = resStr.match(/["'](?:buyingPrice|amount|price)["']\s*:\s*["']?₹?\s?([\d,.]+)/i);
+                        if (rawPriceMatch && rawPriceMatch[1]) {
+                            priceVal = rawPriceMatch[1];
+                        }
+                    }
+
+                    if (priceVal) {
+                        let parsedPrice = parseInt(String(priceVal).replace(/,/g, '').replace(/[^\d]/g, ''));
+                        if (parsedPrice > 10) {
+                            console.log(`✅ Price via Amazon Mobile App API: ₹${parsedPrice}`);
+                            return parsedPrice;
+                        }
                     }
                 }
-            } catch (ajaxErr) {
-                console.log(`⚠️ AJAX Endpoint Failed, falling back to standard HTML parsing...`);
+            } catch (apiErr) {
+                console.log(`⚠️ Mobile App API Attempt Failed (${apiErr.message}), falling back to HTML Scraping...`);
             }
         }
 
-        // 2. Main HTML Fetch
-        console.log(`📥 Fetching HTML for: ${finalUrl}`);
+        // ================= FALLBACK: STANDARD HTML SCRAPING =================
+        console.log(`📥 Fetching Web HTML for: ${finalUrl}`);
         const response = await axios.get(finalUrl, {
             headers: {
                 'User-Agent': getRandomUA(),
-                'Accept-Language': 'en-IN,en-GB;q=0.9,en;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache'
+                'Pragma': 'no-cache',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none'
             },
             timeout: 12000
         });
 
         fetchedHtml = response.data;
+
+        // Captcha Detection Check
+        if (fetchedHtml.includes('validateCaptcha') || fetchedHtml.includes('errors_page/validateCaptcha')) {
+            console.log(`🚨 Captcha Challenge Detected on Web Page! Uploading payload...`);
+            await sendDebugPayload(fetchedHtml, extractedAsin, msgId, finalUrl);
+            return null;
+        }
+
         const $ = cheerio.load(fetchedHtml);
         const lowerHtml = fetchedHtml.toLowerCase();
 
@@ -189,7 +214,7 @@ async function getPrice(url, msgId) {
             return 9999999;
         }
 
-        // Selectors Matching
+        // Amazon Selectors Match
         const offscreenText = $('.a-price .a-offscreen, #corePrice_feature_div .a-offscreen, #apex_desktop .a-offscreen, .priceBlockBuyingPriceString').first().text().trim();
         if (offscreenText) {
             let p = parseInt(offscreenText.replace(/,/g, '').replace(/[^\d]/g, ''));
@@ -203,8 +228,6 @@ async function getPrice(url, msgId) {
         }
 
         console.log(`❌ Price Selectors Matched Nothing.`);
-        
-        // Server par screenshot/HTML render error details bhejna
         await sendDebugPayload(fetchedHtml, extractedAsin, msgId, finalUrl);
         return null;
 
