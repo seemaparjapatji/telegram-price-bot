@@ -18,10 +18,11 @@ let queue = [];
 let activeWorkers = 0;
 const MAX_CONCURRENT_TASKS = 3;
 
+// Mobile User Agents work best against Cloud Render IP Blocks
 const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1'
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.178 Mobile Safari/537.36'
 ];
 
 function getRandomUA() {
@@ -102,16 +103,28 @@ function extractCoupon(text, basePrice) {
 
 async function getPrice(url) {
     try {
-        const finalUrl = await resolveUrl(url);
+        let finalUrl = await resolveUrl(url);
+
+        // Amazon Clean ASIN Link Optimization
+        if (/amazon\./i.test(finalUrl)) {
+            const asinMatch = finalUrl.match(/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
+            if (asinMatch && asinMatch[1]) {
+                finalUrl = `https://www.amazon.in/dp/${asinMatch[1]}`;
+                console.log(`🎯 Amazon Clean Mobile URL: ${finalUrl}`);
+            }
+        }
 
         console.log(`📥 Fetching HTML for: ${finalUrl}`);
         const { data: html } = await axios.get(finalUrl, {
             headers: {
                 'User-Agent': getRandomUA(),
-                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Language': 'en-IN,en-GB;q=0.9,en;q=0.8',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache'
+                'Pragma': 'no-cache',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none'
             },
             timeout: 12000
         });
@@ -119,13 +132,13 @@ async function getPrice(url) {
         const $ = cheerio.load(html);
         const lowerHtml = html.toLowerCase();
 
-        // Stock Status Check
+        // Stock Check
         if (lowerHtml.includes("currently unavailable") || lowerHtml.includes("out of stock") || lowerHtml.includes("sold out")) {
             console.log(`🔴 Status: Out of Stock (Marked 9999999)`);
             return 9999999;
         }
 
-        // 1. JSON-LD Parsing
+        // 1. JSON-LD Parsing (High Precision)
         const jsonLdScripts = $('script[type="application/ld+json"]');
         for (let i = 0; i < jsonLdScripts.length; i++) {
             try {
@@ -135,7 +148,7 @@ async function getPrice(url) {
                     if (offers) {
                         let price = Array.isArray(offers) ? offers[0]?.price : offers?.price;
                         if (price) {
-                            console.log(`✅ Price extracted via JSON-LD: ₹${price}`);
+                            console.log(`✅ Price via JSON-LD: ₹${price}`);
                             return parseInt(price);
                         }
                     }
@@ -143,68 +156,54 @@ async function getPrice(url) {
             } catch (e) {}
         }
 
-        // 2. Flipkart Specific Selectors
+        // 2. Amazon Specific Robust Selectors
+        if (/amazon\./i.test(finalUrl)) {
+            // Offscreen Text
+            const offscreenText = $('.a-price .a-offscreen, #corePrice_feature_div .a-offscreen, #apex_desktop .a-offscreen, .priceBlockBuyingPriceString').first().text().trim();
+            if (offscreenText) {
+                let p = parseInt(offscreenText.replace(/,/g, '').replace(/[^\d]/g, ''));
+                if (p > 10) {
+                    console.log(`✅ Price via Amazon Offscreen: ₹${p}`);
+                    return p;
+                }
+            }
+
+            // Whole Price Span
+            const wholePriceText = $('.a-price-whole').first().text().trim();
+            if (wholePriceText) {
+                let p = parseInt(wholePriceText.replace(/,/g, '').replace(/[^\d]/g, ''));
+                if (p > 10) {
+                    console.log(`✅ Price via Amazon Whole Price: ₹${p}`);
+                    return p;
+                }
+            }
+        }
+
+        // 3. Flipkart Specific Selectors
         if (/flipkart\.com/i.test(finalUrl)) {
-            const fkSelectors = ['._30jeq3', '._16Jk6d', '.Nx9bqj', '[class*="Nx9bqj"]', '._30jeq3._16Jk6d'];
+            const fkSelectors = ['._30jeq3', '._16Jk6d', '.Nx9bqj', '[class*="Nx9bqj"]'];
             for (let s of fkSelectors) {
                 let txt = $(s).first().text().trim();
                 if (txt) {
                     let p = parseInt(txt.replace(/[^\d]/g, ''));
                     if (p > 10) {
-                        console.log(`✅ Price extracted via Flipkart Selector (${s}): ₹${p}`);
+                        console.log(`✅ Price via Flipkart Selector (${s}): ₹${p}`);
                         return p;
                     }
                 }
             }
         }
 
-        // 3. Amazon Specific Selectors (Optimized with Inspect Data)
-        if (/amazon\./i.test(finalUrl)) {
-            // Priority 1: Direct offscreen text (e.g. "₹4,672.16")
-            const offscreenText = $('.a-price .a-offscreen, #corePrice_feature_div .a-offscreen, #apex_desktop .a-offscreen').first().text().trim();
-            if (offscreenText) {
-                // Comma remove karke integer nikalna
-                let p = parseInt(offscreenText.replace(/,/g, '').replace(/[^\d]/g, ''));
-                if (p > 10) {
-                    console.log(`✅ Price extracted via Amazon Offscreen: ₹${p}`);
-                    return p;
-                }
-            }
+        // 4. Emergency Regular Expression Regex Fallback (HTML raw text parse)
+        const priceMatch = html.match(/class="a-price-whole"[^>]*>\s*([\d,]+)/i) || 
+                           html.match(/"priceAmount":\s*([\d.]+)/i) || 
+                           html.match(/["']price["']\s*:\s*["']?([\d,]+)/i);
 
-            // Priority 2: Direct a-price-whole element
-            const wholePriceText = $('.a-price-whole').first().text().trim();
-            if (wholePriceText) {
-                let p = parseInt(wholePriceText.replace(/,/g, '').replace(/[^\d]/g, ''));
-                if (p > 10) {
-                    console.log(`✅ Price extracted via Amazon Whole Price: ₹${p}`);
-                    return p;
-                }
-            }
-
-            // Priority 3: Apex Desktop Feature Container Fallback
-            const amzSelectors = ['#apex_desktop', '#corePrice_feature_div', '#priceblock_ourprice', '#priceblock_dealprice'];
-            for (let s of amzSelectors) {
-                let txt = $(s).find('.a-price-whole').first().text().trim();
-                if (txt) {
-                    let p = parseInt(txt.replace(/,/g, '').replace(/[^\d]/g, ''));
-                    if (p > 10) {
-                        console.log(`✅ Price extracted via Amazon Container (${s}): ₹${p}`);
-                        return p;
-                    }
-                }
-            }
-        }
-
-        // 4. Generic Selectors Fallback
-        const genericSelectors = ['.pdp-discount-summary .pdp-price strong', '.pdp-price', '.prod-sp', '[class*="price"]'];
-        for (let s of genericSelectors) {
-            let txt = $(s).first().text().trim();
-            if (txt) {
-                let p = parseInt(txt.replace(/[^\d]/g, ''));
-                if (p > 10) {
-                    console.log(`✅ Price extracted via Generic Selector (${s}): ₹${p}`);
-                    return p;
-                }
+        if (priceMatch && priceMatch[1]) {
+            let p = parseInt(priceMatch[1].replace(/,/g, ''));
+            if (p > 10) {
+                console.log(`✅ Price via Regex Emergency Fallback: ₹${p}`);
+                return p;
             }
         }
 
