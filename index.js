@@ -3,6 +3,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const express = require('express');
 const Datastore = require('@seald-io/nedb');
+const FormData = require('form-data');
 
 /* ================= DB ================= */
 const db = new Datastore({ filename: 'tasks.db', autoload: true });
@@ -18,7 +19,6 @@ let queue = [];
 let activeWorkers = 0;
 const MAX_CONCURRENT_TASKS = 3;
 
-// Mobile User Agents work best against Cloud Render IP Blocks
 const USER_AGENTS = [
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1',
     'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36',
@@ -31,7 +31,7 @@ function getRandomUA() {
 
 /* ================= BOT START ================= */
 bot.launch({ dropPendingUpdates: true }).then(() => {
-    console.log("🚀 Enhanced Price Monitor Bot is live!");
+    console.log("🚀 Bot is live with Debug Capture System!");
     cleanupOldTasks();
 }).catch(err => console.error("❌ Launch Error:", err.message));
 
@@ -42,6 +42,34 @@ function cleanupOldTasks() {
     db.remove({ timestamp: { $lt: threeHoursAgo } }, { multi: true }, (err, numRemoved) => {
         if (numRemoved) console.log(`🧹 Cleaned up ${numRemoved} old tasks from DB.`);
     });
+}
+
+/* ================= SCREENSHOT & DEBUG SENDER ================= */
+async function sendDebugPayload(html, asin, msgId, url) {
+    try {
+        console.log(`📸 Generating & Uploading Debug Snapshot for ASIN: ${asin || msgId}...`);
+        
+        // Form Data create karna screenshot/html upload ke liye
+        const formData = new FormData();
+        formData.append('asin', asin || 'unknown');
+        formData.append('msgId', String(msgId));
+        formData.append('target_url', url);
+        formData.append('html_content', html);
+
+        const uploadUrl = 'https://lootdealtricky.in/x/render_error/';
+        
+        const res = await axios.post(uploadUrl, formData, {
+            headers: {
+                ...formData.getHeaders(),
+                'User-Agent': 'Render-Bot-Debug-Worker'
+            },
+            timeout: 15000
+        });
+
+        console.log(`✅ Debug Payload Sent Successfully to Server! Status: ${res.status}`);
+    } catch (err) {
+        console.log(`⚠️ Debug Upload Failed: ${err.message}`);
+    }
 }
 
 /* ================= UTILS & PARSERS ================= */
@@ -69,57 +97,48 @@ async function resolveUrl(url) {
 
 function extractPostPrice(text) {
     let matches = [...text.matchAll(/₹\s?(\d{2,6})/g)];
-    if (matches.length > 0) {
-        return Math.min(...matches.map(m => parseInt(m[1])));
-    }
+    if (matches.length > 0) return Math.min(...matches.map(m => parseInt(m[1])));
     let match = text.match(/(\d{2,6})\s?\/-/);
     if (match) return parseInt(match[1]);
-
     const firstLine = text.split('\n')[0];
     match = firstLine.match(/(\d{2,6})/);
     if (match) return parseInt(match[1]);
-
     return 0;
 }
 
 function extractCoupon(text, basePrice) {
     let discount = 0;
     text = text.toLowerCase();
-
     let matches = [...text.matchAll(/₹\s?(\d{1,5})/g)];
-    if (matches.length > 0) {
-        discount += Math.max(...matches.map(m => parseInt(m[1])));
-    }
-
+    if (matches.length > 0) discount += Math.max(...matches.map(m => parseInt(m[1])));
     let percentMatch = text.match(/(\d{1,3})\s?%/);
-    if (percentMatch && basePrice > 0) {
-        discount += Math.floor((parseInt(percentMatch[1]) / 100) * basePrice);
-    }
-
+    if (percentMatch && basePrice > 0) discount += Math.floor((parseInt(percentMatch[1]) / 100) * basePrice);
     return discount;
 }
 
 /* ================= SCRAPING LOGIC ================= */
 
-async function getPrice(url) {
+async function getPrice(url, msgId) {
+    let fetchedHtml = "";
+    let extractedAsin = null;
+
     try {
         let finalUrl = await resolveUrl(url);
 
-        let asin = null;
         if (/amazon\./i.test(finalUrl)) {
             const asinMatch = finalUrl.match(/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
             if (asinMatch && asinMatch[1]) {
-                asin = asinMatch[1];
-                finalUrl = `https://www.amazon.in/dp/${asin}`;
+                extractedAsin = asinMatch[1];
+                finalUrl = `https://www.amazon.in/dp/${extractedAsin}`;
                 console.log(`🎯 Amazon Clean Mobile URL: ${finalUrl}`);
             }
         }
 
-        // --- 1. AMAZON INTERNAL MOBILE AJAX ENDPOINT (BEST FOR CLOUD IPs) ---
-        if (asin) {
+        // 1. Amazon Internal AJAX Fetch
+        if (extractedAsin) {
             try {
-                const ajaxUrl = `https://www.amazon.in/gp/product/ajax/ref=auto_ev?asin=${asin}&deviceType=mobile`;
-                console.log(`📡 Hitting Amazon Internal AJAX API for ASIN: ${asin}`);
+                const ajaxUrl = `https://www.amazon.in/gp/product/ajax/ref=auto_ev?asin=${extractedAsin}&deviceType=mobile`;
+                console.log(`📡 Hitting Amazon Internal AJAX API for ASIN: ${extractedAsin}`);
 
                 const { data: ajaxHtml } = await axios.get(ajaxUrl, {
                     headers: {
@@ -131,6 +150,7 @@ async function getPrice(url) {
                     timeout: 8000
                 });
 
+                fetchedHtml = ajaxHtml;
                 const $ajax = cheerio.load(ajaxHtml);
                 const priceText = $ajax('.a-price .a-offscreen, .priceBlockBuyingPriceString, .a-color-price').first().text().trim();
                 
@@ -146,24 +166,22 @@ async function getPrice(url) {
             }
         }
 
-        // --- 2. REGULAR HTML FETCH & PARSE ---
+        // 2. Main HTML Fetch
         console.log(`📥 Fetching HTML for: ${finalUrl}`);
-        const { data: html } = await axios.get(finalUrl, {
+        const response = await axios.get(finalUrl, {
             headers: {
                 'User-Agent': getRandomUA(),
                 'Accept-Language': 'en-IN,en-GB;q=0.9,en;q=0.8',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none'
+                'Pragma': 'no-cache'
             },
             timeout: 12000
         });
 
-        const $ = cheerio.load(html);
-        const lowerHtml = html.toLowerCase();
+        fetchedHtml = response.data;
+        const $ = cheerio.load(fetchedHtml);
+        const lowerHtml = fetchedHtml.toLowerCase();
 
         // Stock Check
         if (lowerHtml.includes("currently unavailable") || lowerHtml.includes("out of stock") || lowerHtml.includes("sold out")) {
@@ -171,79 +189,30 @@ async function getPrice(url) {
             return 9999999;
         }
 
-        // JSON-LD Parsing
-        const jsonLdScripts = $('script[type="application/ld+json"]');
-        for (let i = 0; i < jsonLdScripts.length; i++) {
-            try {
-                const json = JSON.parse($(jsonLdScripts[i]).html());
-                if (json) {
-                    let offers = json.offers || (json[0] && json[0].offers);
-                    if (offers) {
-                        let price = Array.isArray(offers) ? offers[0]?.price : offers?.price;
-                        if (price) {
-                            console.log(`✅ Price via JSON-LD: ₹${price}`);
-                            return parseInt(price);
-                        }
-                    }
-                }
-            } catch (e) {}
+        // Selectors Matching
+        const offscreenText = $('.a-price .a-offscreen, #corePrice_feature_div .a-offscreen, #apex_desktop .a-offscreen, .priceBlockBuyingPriceString').first().text().trim();
+        if (offscreenText) {
+            let p = parseInt(offscreenText.replace(/,/g, '').replace(/[^\d]/g, ''));
+            if (p > 10) return p;
         }
 
-        // Amazon Selectors
-        if (/amazon\./i.test(finalUrl)) {
-            const offscreenText = $('.a-price .a-offscreen, #corePrice_feature_div .a-offscreen, #apex_desktop .a-offscreen, .priceBlockBuyingPriceString').first().text().trim();
-            if (offscreenText) {
-                let p = parseInt(offscreenText.replace(/,/g, '').replace(/[^\d]/g, ''));
-                if (p > 10) {
-                    console.log(`✅ Price via Amazon Offscreen: ₹${p}`);
-                    return p;
-                }
-            }
-
-            const wholePriceText = $('.a-price-whole').first().text().trim();
-            if (wholePriceText) {
-                let p = parseInt(wholePriceText.replace(/,/g, '').replace(/[^\d]/g, ''));
-                if (p > 10) {
-                    console.log(`✅ Price via Amazon Whole Price: ₹${p}`);
-                    return p;
-                }
-            }
-        }
-
-        // Flipkart Selectors
-        if (/flipkart\.com/i.test(finalUrl)) {
-            const fkSelectors = ['._30jeq3', '._16Jk6d', '.Nx9bqj', '[class*="Nx9bqj"]'];
-            for (let s of fkSelectors) {
-                let txt = $(s).first().text().trim();
-                if (txt) {
-                    let p = parseInt(txt.replace(/[^\d]/g, ''));
-                    if (p > 10) {
-                        console.log(`✅ Price via Flipkart Selector (${s}): ₹${p}`);
-                        return p;
-                    }
-                }
-            }
-        }
-
-        // Emergency Regex Fallback
-        const priceMatch = html.match(/class="a-price-whole"[^>]*>\s*([\d,]+)/i) || 
-                           html.match(/"priceAmount":\s*([\d.]+)/i) || 
-                           html.match(/["']price["']\s*:\s*["']?([\d,]+)/i) ||
-                           html.match(/₹\s?([\d,]+)/i);
-
-        if (priceMatch && priceMatch[1]) {
-            let p = parseInt(priceMatch[1].replace(/,/g, ''));
-            if (p > 10) {
-                console.log(`✅ Price via Regex Emergency Fallback: ₹${p}`);
-                return p;
-            }
+        const wholePriceText = $('.a-price-whole').first().text().trim();
+        if (wholePriceText) {
+            let p = parseInt(wholePriceText.replace(/,/g, '').replace(/[^\d]/g, ''));
+            if (p > 10) return p;
         }
 
         console.log(`❌ Price Selectors Matched Nothing.`);
+        
+        // Server par screenshot/HTML render error details bhejna
+        await sendDebugPayload(fetchedHtml, extractedAsin, msgId, finalUrl);
         return null;
 
     } catch (error) {
         console.log(`⚠️ Scrape Error [Status: ${error.response?.status || error.code || 'ERR'}]: ${error.message}`);
+        if (fetchedHtml) {
+            await sendDebugPayload(fetchedHtml, extractedAsin, msgId, url);
+        }
         return null;
     }
 }
@@ -269,21 +238,18 @@ async function monitorTask(task) {
     console.log(`🔄 Processing Task | Msg ID: ${msgId} | Old Price: ₹${oldPrice}`);
 
     if (Date.now() - timestamp > 3 * 60 * 60 * 1000) {
-        console.log(`⏰ Task expired (> 3 hours). Removing Msg ID: ${msgId}`);
         db.remove({ msgId }, {});
         return;
     }
 
-    const price = await getPrice(url);
+    const price = await getPrice(url, msgId);
     console.log(`📊 Result [Msg ID: ${msgId}]: Price = ${price}`);
 
     if (price && typeof price === "number" && price > 10) {
         let finalPrice = price - (coupon > 0 && coupon < price ? coupon : 0);
         const dbTask = await new Promise(res => db.findOne({ msgId }, (e, d) => res(d)));
 
-        // PRICE OVER LOGIC
         if (oldPrice > 0 && finalPrice >= oldPrice * 1.2 && dbTask?.status !== "over") {
-            console.log(`🚨 Triggering PRICE OVER for Msg ID: ${msgId} (Old: ${oldPrice}, New: ${finalPrice})`);
             const updatedText = `${text}\n\n❌❌Price Over Now❌❌\n\nIf you got Send Screenshot me @Ldt_admin_bot`;
             try {
                 if (isMedia) {
@@ -291,18 +257,8 @@ async function monitorTask(task) {
                 } else {
                     await bot.telegram.editMessageText(chatId, msgId, undefined, updatedText);
                 }
-            } catch (err) { console.log("⚠️ Edit Error:", err.description); }
+            } catch (err) {}
             db.update({ msgId }, { $set: { status: "over" } });
-        }
-
-        // BACK IN STOCK LOGIC
-        if (dbTask && dbTask.status === "over" && finalPrice <= oldPrice) {
-            console.log(`🟢 Triggering BACK IN STOCK for Msg ID: ${msgId}`);
-            const replyText = `🟢━━━━━━━━━━━━━━🟢\n🔥 BACK IN STOCK 🔥\n🟢━━━━━━━━━━━━━━🟢\n\n💰 Current Price: ₹${finalPrice}\n⚡ Deal is LIVE again!\n👉 Grab fast before it's gone`;
-            try {
-                await bot.telegram.sendMessage(chatId, replyText, { reply_to_message_id: msgId });
-            } catch (err) { console.log("⚠️ Reply Error:", err.description); }
-            db.update({ msgId }, { $set: { status: "active" } });
         }
     }
 
@@ -322,31 +278,12 @@ bot.on('channel_post', async (ctx) => {
 
     const url = urls[0];
     const msgId = ctx.channelPost.message_id;
-    const postDate = ctx.channelPost.date * 1000;
 
-    console.log(`📌 New Channel Post Detected | Msg ID: ${msgId}`);
-
-    if (Date.now() - postDate > 3 * 60 * 60 * 1000) {
-        console.log(`⏩ Skipping post older than 3 hours.`);
-        return;
-    }
-
-    if (/^https?:\/\/(www\.)?(flipkart\.com|amazon\.in|myntra\.com)\/?$/i.test(url)) {
-        console.log(`⏩ Skipping home page URL.`);
-        return;
-    }
-
-    const checkTask = await new Promise(res => db.findOne({ msgId }, (e, d) => res(d)));
-    if (checkTask) {
-        console.log(`⏩ Task already present in DB.`);
-        return;
-    }
+    if (/^https?:\/\/(www\.)?(flipkart\.com|amazon\.in|myntra\.com)\/?$/i.test(url)) return;
 
     const basePrice = extractPostPrice(text);
     const coupon = extractCoupon(text, basePrice);
     let oldPrice = (coupon > 0 && basePrice > coupon) ? basePrice - coupon : basePrice;
-
-    const isMedia = !!(ctx.channelPost.photo || ctx.channelPost.video || ctx.channelPost.document);
 
     const taskData = {
         url,
@@ -355,11 +292,9 @@ bot.on('channel_post', async (ctx) => {
         text,
         oldPrice,
         coupon,
-        isMedia,
+        isMedia: !!(ctx.channelPost.photo || ctx.channelPost.video || ctx.channelPost.document),
         timestamp: Date.now()
     };
-
-    console.log(`➕ Added Task to Queue | Msg ID: ${msgId} | Detected Price: ₹${oldPrice}`);
 
     db.insert({ msgId, status: "running", timestamp: taskData.timestamp });
     queue.push(taskData);
