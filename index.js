@@ -105,15 +105,48 @@ async function getPrice(url) {
     try {
         let finalUrl = await resolveUrl(url);
 
-        // Amazon Clean ASIN Link Optimization
+        let asin = null;
         if (/amazon\./i.test(finalUrl)) {
             const asinMatch = finalUrl.match(/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
             if (asinMatch && asinMatch[1]) {
-                finalUrl = `https://www.amazon.in/dp/${asinMatch[1]}`;
+                asin = asinMatch[1];
+                finalUrl = `https://www.amazon.in/dp/${asin}`;
                 console.log(`🎯 Amazon Clean Mobile URL: ${finalUrl}`);
             }
         }
 
+        // --- 1. AMAZON INTERNAL MOBILE AJAX ENDPOINT (BEST FOR CLOUD IPs) ---
+        if (asin) {
+            try {
+                const ajaxUrl = `https://www.amazon.in/gp/product/ajax/ref=auto_ev?asin=${asin}&deviceType=mobile`;
+                console.log(`📡 Hitting Amazon Internal AJAX API for ASIN: ${asin}`);
+
+                const { data: ajaxHtml } = await axios.get(ajaxUrl, {
+                    headers: {
+                        'User-Agent': getRandomUA(),
+                        'Accept': 'text/html,*/*',
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Accept-Language': 'en-IN,en;q=0.9'
+                    },
+                    timeout: 8000
+                });
+
+                const $ajax = cheerio.load(ajaxHtml);
+                const priceText = $ajax('.a-price .a-offscreen, .priceBlockBuyingPriceString, .a-color-price').first().text().trim();
+                
+                if (priceText) {
+                    let p = parseInt(priceText.replace(/,/g, '').replace(/[^\d]/g, ''));
+                    if (p > 10) {
+                        console.log(`✅ Price via Amazon AJAX API: ₹${p}`);
+                        return p;
+                    }
+                }
+            } catch (ajaxErr) {
+                console.log(`⚠️ AJAX Endpoint Failed, falling back to standard HTML parsing...`);
+            }
+        }
+
+        // --- 2. REGULAR HTML FETCH & PARSE ---
         console.log(`📥 Fetching HTML for: ${finalUrl}`);
         const { data: html } = await axios.get(finalUrl, {
             headers: {
@@ -138,7 +171,7 @@ async function getPrice(url) {
             return 9999999;
         }
 
-        // 1. JSON-LD Parsing (High Precision)
+        // JSON-LD Parsing
         const jsonLdScripts = $('script[type="application/ld+json"]');
         for (let i = 0; i < jsonLdScripts.length; i++) {
             try {
@@ -156,9 +189,8 @@ async function getPrice(url) {
             } catch (e) {}
         }
 
-        // 2. Amazon Specific Robust Selectors
+        // Amazon Selectors
         if (/amazon\./i.test(finalUrl)) {
-            // Offscreen Text
             const offscreenText = $('.a-price .a-offscreen, #corePrice_feature_div .a-offscreen, #apex_desktop .a-offscreen, .priceBlockBuyingPriceString').first().text().trim();
             if (offscreenText) {
                 let p = parseInt(offscreenText.replace(/,/g, '').replace(/[^\d]/g, ''));
@@ -168,7 +200,6 @@ async function getPrice(url) {
                 }
             }
 
-            // Whole Price Span
             const wholePriceText = $('.a-price-whole').first().text().trim();
             if (wholePriceText) {
                 let p = parseInt(wholePriceText.replace(/,/g, '').replace(/[^\d]/g, ''));
@@ -179,7 +210,7 @@ async function getPrice(url) {
             }
         }
 
-        // 3. Flipkart Specific Selectors
+        // Flipkart Selectors
         if (/flipkart\.com/i.test(finalUrl)) {
             const fkSelectors = ['._30jeq3', '._16Jk6d', '.Nx9bqj', '[class*="Nx9bqj"]'];
             for (let s of fkSelectors) {
@@ -194,10 +225,11 @@ async function getPrice(url) {
             }
         }
 
-        // 4. Emergency Regular Expression Regex Fallback (HTML raw text parse)
+        // Emergency Regex Fallback
         const priceMatch = html.match(/class="a-price-whole"[^>]*>\s*([\d,]+)/i) || 
                            html.match(/"priceAmount":\s*([\d.]+)/i) || 
-                           html.match(/["']price["']\s*:\s*["']?([\d,]+)/i);
+                           html.match(/["']price["']\s*:\s*["']?([\d,]+)/i) ||
+                           html.match(/₹\s?([\d,]+)/i);
 
         if (priceMatch && priceMatch[1]) {
             let p = parseInt(priceMatch[1].replace(/,/g, ''));
