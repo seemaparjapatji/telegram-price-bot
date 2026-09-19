@@ -20,7 +20,7 @@ app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`))
 /* ================= GLOBAL CONFIGS ================= */
 let queue = [];
 let activeWorkers = 0;
-const MAX_CONCURRENT_TASKS = 1; // Strict 1 worker to prevent RAM limits on Render Free Tier
+const MAX_CONCURRENT_TASKS = 1;
 
 /* ================= BOT START WITH CONFLICT RETRY ================= */
 async function startBot() {
@@ -29,9 +29,9 @@ async function startBot() {
             dropPendingUpdates: true,
             allowedUpdates: ['channel_post']
         });
-        console.log("🚀 Bot is live with Optimized OCR Scraper!");
+        console.log("🚀 Bot is live with Hybrid Scraper & OCR!");
     } catch (err) {
-        console.error("❌ Bot Launch Conflict/Error:", err.message);
+        console.error("❌ Bot Launch Error:", err.message);
         if (err.message.includes('409')) {
             console.log("⚠️ 409 Conflict Detected. Retrying launch in 10 seconds...");
             setTimeout(startBot, 10000);
@@ -49,29 +49,25 @@ function cleanupOldTasks() {
     });
 }
 
-/* ================= DEBUG / SCREENSHOT SENDER ================= */
+/* ================= DEBUG SENDER ================= */
 async function sendDebugPayload(imageBuffer, asin, msgId, url) {
     try {
-        console.log(`📸 Uploading OCR Screenshot Log for ASIN: ${asin || msgId}...`);
-        
         const formData = new FormData();
         formData.append('asin', asin || 'unknown');
         formData.append('msgId', String(msgId));
         formData.append('target_url', url);
         formData.append('file', imageBuffer, { filename: `screenshot_${msgId}.png` });
 
-        const uploadUrl = 'https://lootdealtricky.in/x/render_error/';
-        
-        await axios.post(uploadUrl, formData, {
+        await axios.post('https://lootdealtricky.in/x/render_error/', formData, {
             headers: {
                 ...formData.getHeaders(),
-                'User-Agent': 'Render-Bot-OCR-Worker'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
             },
-            timeout: 15000
+            timeout: 10000
         });
-        console.log(`✅ Screenshot Log Sent Successfully!`);
+        console.log(`✅ Screenshot Log Uploaded.`);
     } catch (err) {
-        console.log(`⚠️ Debug Upload Failed: ${err.message}`);
+        console.log(`⚠️ Debug Upload Ignored (Status: ${err.response?.status || err.message})`);
     }
 }
 
@@ -111,7 +107,7 @@ function extractCoupon(text, basePrice) {
     return discount;
 }
 
-/* ================= OCR ENGINE & BROWSER SCRAPER ================= */
+/* ================= SCRAPER ENGINE ================= */
 
 async function getPriceViaOCR(url, msgId) {
     let browser = null;
@@ -133,24 +129,23 @@ async function getPriceViaOCR(url, msgId) {
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
                 '--no-first-run',
-                '--no-zygote',
-                '--single-process', // Low memory footprint
+                '--single-process',
                 '--disable-gpu'
             ],
-            defaultViewport: { width: 390, height: 844, isMobile: true },
+            defaultViewport: { width: 412, height: 915, isMobile: true },
             executablePath: await chromium.executablePath(),
             headless: chromium.headless,
         });
 
         const page = await browser.newPage();
 
-        // Block Images, CSS & Fonts to drastically speed up page loading & fix timeout
+        // Selective Resource Blocking (Do NOT block CSS/Fonts as Flipkart/Amazon require them for price rendering)
         await page.setRequestInterception(true);
         page.on('request', (req) => {
             const resourceType = req.resourceType();
-            if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+            const reqUrl = req.url().toLowerCase();
+            if (['media', 'font'].includes(resourceType) || reqUrl.includes('google-analytics') || reqUrl.includes('doubleclick')) {
                 req.abort();
             } else {
                 req.continue();
@@ -159,26 +154,40 @@ async function getPriceViaOCR(url, msgId) {
 
         await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1');
         
-        // Timeout set to 35 seconds + domcontentloaded for fast speed
         await page.goto(finalUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
 
+        // Step 1: DOM Inspection First (Faster & Precise)
+        const pageContent = await page.content();
+        
+        // Flipkart/Amazon stock check
+        if (pageContent.toLowerCase().includes("sold out") || pageContent.toLowerCase().includes("currently unavailable")) {
+            console.log(`🔴 Product Out of Stock (9999999)`);
+            await browser.close();
+            return 9999999;
+        }
+
+        // Direct Text Price Match from DOM
+        const domPriceMatches = [...pageContent.matchAll(/₹\s?([\d,]{2,7})/g)];
+        if (domPriceMatches.length > 0) {
+            let validPrices = domPriceMatches.map(m => parseInt(m[1].replace(/,/g, ''))).filter(p => p > 10 && p < 1000000);
+            if (validPrices.length > 0) {
+                const domPrice = Math.min(...validPrices);
+                console.log(`✅ Direct DOM Match Price: ₹${domPrice}`);
+                await browser.close();
+                return domPrice;
+            }
+        }
+
+        // Step 2: Fallback to OCR Screenshot
         const screenshotBuffer = await page.screenshot({ fullPage: false, type: 'png' });
         await browser.close();
         browser = null;
 
         console.log(`🔍 Running Tesseract OCR on page screenshot...`);
 
-        const { data: { text } } = await Tesseract.recognize(screenshotBuffer, 'eng', {
-            logger: m => {} 
-        });
+        const { data: { text } } = await Tesseract.recognize(screenshotBuffer, 'eng', { logger: () => {} });
 
         console.log(`📝 OCR Extracted Raw Text:\n${text.substring(0, 200)}...`);
-
-        const lowerText = text.toLowerCase();
-        if (lowerText.includes("currently unavailable") || lowerText.includes("out of stock") || lowerText.includes("sold out")) {
-            console.log(`🔴 Status via OCR: Out of Stock (9999999)`);
-            return 9999999;
-        }
 
         const priceMatches = [...text.matchAll(/(?:₹|INR|\$)\s?([\d,]{2,7})/gi)];
         let detectedPrices = priceMatches.map(m => parseInt(m[1].replace(/,/g, ''))).filter(p => p > 10 && p < 1000000);
@@ -189,12 +198,12 @@ async function getPriceViaOCR(url, msgId) {
             return finalPrice;
         }
 
-        console.log(`❌ OCR failed to find valid price pattern.`);
+        console.log(`❌ Price pattern not found.`);
         await sendDebugPayload(screenshotBuffer, asin, msgId, finalUrl);
         return null;
 
     } catch (err) {
-        console.log(`⚠️ Browser/OCR Engine Error: ${err.message}`);
+        console.log(`⚠️ Scraper Engine Error: ${err.message}`);
         if (browser) await browser.close();
         return null;
     }
